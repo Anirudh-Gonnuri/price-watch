@@ -9,6 +9,17 @@ from unittest import mock
 
 import watch
 
+
+
+def setUpModule():
+    """Keep every test away from Atrium's real history, wherever this folder lives."""
+    tmp = tempfile.TemporaryDirectory()
+    patcher = mock.patch.dict("os.environ", {"ATRIUM_EVENTS": str(Path(tmp.name) / "events.jsonl")})
+    patcher.start()
+    unittest.addModuleCleanup(tmp.cleanup)
+    unittest.addModuleCleanup(patcher.stop)
+
+
 URL = "https://www.amazon.in/dp/B0DSKL9MQ8"
 MARKER = watch.AMAZON_MARKER
 
