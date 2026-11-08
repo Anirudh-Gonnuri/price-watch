@@ -15,7 +15,6 @@ on:
   push:
     paths:
       - watch.py
-      - targets.json
       - .github/workflows/watch.yml
 
 # Never let two checks overlap; they'd race on the saved state.
@@ -43,16 +42,29 @@ jobs:
           key: watch-state-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: watch-state-
 
-      - name: Check Amazon
+      # targets.json isn't in the (public) repo; `watch.py add/remove` keeps a
+      # copy in this repo variable. Passed via env, never pasted into the script.
+      - name: Load targets
+        env:
+          WATCH_TARGETS: ${{ vars.WATCH_TARGETS }}
+        run: |
+          if [ -n "$WATCH_TARGETS" ]; then
+            printf '%s' "$WATCH_TARGETS" > targets.json
+          else
+            echo '{"targets": []}' > targets.json
+          fi
+          python3 -m json.tool targets.json > /dev/null  # fail loudly on a bad variable
+
+      - name: Check targets
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: |
-          # Exit code 2 means Amazon blocked this run. That's expected now and
+          # Exit code 2 means a site blocked this run. That's expected now and
           # then, so flag it without failing the job (failures email you).
           # watch.py itself pushes a warning after 6 blocked runs in a row.
           python3 watch.py ${{ github.event.schedule == '30 2 * * *' && '--heartbeat' || '' }} || {
             code=$?
-            if [ "$code" -eq 2 ]; then echo "::warning::Amazon blocked this check"; else exit "$code"; fi
+            if [ "$code" -eq 2 ]; then echo "::warning::A site blocked this check"; else exit "$code"; fi
           }
 
       - name: Save state

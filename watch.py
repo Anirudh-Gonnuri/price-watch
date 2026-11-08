@@ -6,12 +6,14 @@ scheduler (Windows Task Scheduler, cron, GitHub Actions, ...) is responsible
 for running it repeatedly.
 
 Supported sites:
-  amazon   Wait for a specific variant to appear on a listing and be buyable.
+  amazon   With `asin`: a product page, alerting when it's buyable and (if
+           `max_price` is set) at or under that price.
+           With `listing` + `match`: wait for a variant to appear and be buyable.
            Reads the listing's variant table (`dimensionValuesDisplayData`),
            finds the variant whose labels contain every `match` term, then
            checks that variant's page for an Add to Cart button.
-  flipkart Wait for a product page's price to drop to `max_price` or below
-           while in stock. Reads the page's schema.org Product data, the
+  flipkart A product page, alerting when it's in stock and (if `max_price` is
+           set) at or under that price. Reads the page's schema.org Product data, the
            structured block Flipkart publishes for search engines, rather
            than its visual layout, which changes far more often.
 
@@ -40,6 +42,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -213,7 +216,36 @@ def parse_amazon_product(page: str) -> tuple[str, int | None, bool, str]:
     return title, price, buyable, availability
 
 
+def stock_and_price_result(title: str, price: int | None, in_stock: bool,
+                           max_price: int | None, url: str) -> Result:
+    """Shared rule for 'buy when in stock (and at or under max_price, if given)'."""
+    if not in_stock:
+        return Result("out_of_stock", good=False, status_text="sold out",
+                      title=title, price=price, url=url)
+    if max_price is None:
+        return Result("in_stock", good=True, status_text="in stock",
+                      title=title, price=price, url=url)
+    target = format_inr(max_price)
+    if price is not None and price <= max_price:
+        return Result("at_target", good=True,
+                      status_text=f"at {format_inr(price)} (target {target})",
+                      title=title, price=price, url=url)
+    # No visible price counts as "not at target": never alert on a guess.
+    return Result("above_target", good=False, status_text=f"above your {target} target",
+                  title=title, price=price, url=url)
+
+
+def check_amazon_product(host: str, asin: str, max_price: int | None) -> Result:
+    """A specific product page: alert when buyable (and at or under max_price)."""
+    url = f"https://{host}/dp/{asin}?th=1&psc=1"
+    title, price, buyable, availability = parse_amazon_product(fetch(url, AMAZON_MARKER))
+    result = stock_and_price_result(title, price, buyable, max_price, url)
+    result.detail = availability or None
+    return result
+
+
 def check_amazon(host: str, listing: str, match: list[str]) -> Result:
+    """A variant that may not be listed yet: alert when it appears and is buyable."""
     listing_page = fetch(f"https://{host}/dp/{listing}?th=1", AMAZON_MARKER)
     variants = parse_variants(listing_page)
     asin = find_variant(variants, match)
@@ -259,18 +291,9 @@ def parse_flipkart_product(page: str) -> tuple[str, int, bool]:
     raise LayoutChanged("no schema.org Product data on the page")
 
 
-def check_flipkart(url: str, max_price: int) -> Result:
+def check_flipkart(url: str, max_price: int | None) -> Result:
     name, price, in_stock = parse_flipkart_product(fetch(url, FLIPKART_MARKER))
-    target = format_inr(max_price)
-    if not in_stock:
-        return Result("out_of_stock", good=False, status_text="sold out",
-                      title=name, price=price, url=url)
-    if price <= max_price:
-        return Result("at_target", good=True,
-                      status_text=f"at {format_inr(price)} (target {target})",
-                      title=name, price=price, url=url)
-    return Result("above_target", good=False, status_text=f"above your {target} target",
-                  title=name, price=price, url=url)
+    return stock_and_price_result(name, price, in_stock, max_price, url)
 
 
 # --------------------------------------------------------------------------- #
@@ -282,13 +305,19 @@ SITES = {"amazon": "Amazon", "flipkart": "Flipkart"}
 
 def build_target(entry: dict) -> Target:
     site = entry["site"]
-    if site == "amazon":
+    max_price = int(entry["max_price"]) if entry.get("max_price") is not None else None
+    if site == "amazon" and "asin" in entry:
+        host, asin = entry["host"], entry["asin"]
+
+        def check() -> Result:
+            return check_amazon_product(host, asin, max_price)
+    elif site == "amazon":
         host, listing, match = entry["host"], entry["listing"], entry["match"]
 
         def check() -> Result:
             return check_amazon(host, listing, match)
     elif site == "flipkart":
-        url, max_price = entry["url"], int(entry["max_price"])
+        url = entry["url"]
 
         def check() -> Result:
             return check_flipkart(url, max_price)
@@ -297,12 +326,92 @@ def build_target(entry: dict) -> Target:
     return Target(key=entry["key"], site=SITES[site], label=entry["label"], check=check)
 
 
-def load_targets(path: Path = CONFIG_FILE) -> list[Target]:
+def load_entries(path: Path | None = None) -> list[dict]:
+    """Raw target entries; an absent file means nothing is being watched."""
+    path = path or CONFIG_FILE  # resolved at call time, so tests can repoint it
+    if not path.exists():
+        return []
     entries = json.loads(path.read_text())["targets"]
     keys = [e["key"] for e in entries]
     if len(keys) != len(set(keys)):
         raise ValueError(f"duplicate target keys in {path}")
-    return [build_target(e) for e in entries]
+    return entries
+
+
+def save_entries(entries: list[dict], path: Path | None = None) -> None:
+    path = path or CONFIG_FILE
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"targets": entries}, indent=2, ensure_ascii=False) + "\n")
+    tmp.replace(path)
+
+
+def load_targets(path: Path | None = None) -> list[Target]:
+    return [build_target(e) for e in load_entries(path)]
+
+
+# --------------------------------------------------------------------------- #
+# Turning a pasted link into a target
+# --------------------------------------------------------------------------- #
+
+SHORT_LINK_HOSTS = {"amzn.in", "amzn.to", "a.co", "dl.flipkart.com", "fkrt.it", "fkrt.cc"}
+
+
+def resolve_short_link(url: str) -> str:
+    """Follow redirects from share links (amzn.in/d/..., dl.flipkart.com/...)."""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.geturl()
+    except urllib.error.HTTPError as e:
+        return e.geturl() or url  # the redirect target is still known on a blocked page
+
+
+def parse_link(url: str) -> dict:
+    """Map a product link to a target entry (minus label and max_price)."""
+    url = url.strip()
+    if not re.match(r"https?://", url):
+        url = "https://" + url
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    if host in SHORT_LINK_HOSTS:
+        return parse_link(resolve_short_link(url))
+
+    if host == "amazon.in" or host.endswith(".amazon.in"):
+        m = re.search(r"/(?:dp|gp/product|gp/aw/d)/([A-Z0-9]{10})", parts.path)
+        if not m:
+            raise ValueError("couldn't find a product ID (ASIN) in that Amazon link")
+        asin = m.group(1)
+        return {"key": f"amazon-{asin.lower()}", "site": "amazon",
+                "host": "www.amazon.in", "asin": asin}
+
+    if host == "flipkart.com" or host.endswith(".flipkart.com"):
+        m = re.search(r"/p/(itm[0-9a-z]+)", parts.path)
+        if not m:
+            raise ValueError("that Flipkart link isn't a product page (no /p/itm... in it)")
+        # pid pins the exact variant (colour/storage); everything else is tracking.
+        pid = urllib.parse.parse_qs(parts.query).get("pid", [None])[0]
+        clean = f"https://www.flipkart.com{parts.path}" + (f"?pid={pid}" if pid else "")
+        return {"key": f"flipkart-{(pid or m.group(1)).lower()}", "site": "flipkart",
+                "url": clean}
+
+    raise ValueError(f"unsupported site {host!r}: only amazon.in and flipkart.com links work")
+
+
+def parse_price(text: str) -> int:
+    """'1,09,999', '₹109999' or '109999' -> 109999."""
+    digits = re.sub(r"[^\d]", "", text.split(".")[0])
+    if not digits:
+        raise ValueError(f"not a price: {text!r}")
+    return int(digits)
+
+
+def short_label(title: str) -> str:
+    """Trim marketing tails: 'Phone 5G (White, 512GB), 200MP Camera, ...' -> up to ')'."""
+    title = re.sub(r"\s+", " ", title).strip()
+    close = title.find(")")
+    if 0 < close < 120:
+        return title[:close + 1]
+    return re.split(r"[,|]", title)[0][:80].strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -513,8 +622,154 @@ def run(args: argparse.Namespace, targets: list[Target] | None = None) -> int:
     return 0 if all_ok else 2
 
 
+# --------------------------------------------------------------------------- #
+# Managing targets and schedules (add / list / remove / pause / resume)
+# --------------------------------------------------------------------------- #
+
+GITHUB_VARIABLE = "WATCH_TARGETS"  # the scheduled workflow writes this to targets.json
+WINDOWS_TASK = "Price Watch"
+
+
+def sync_github(entries: list[dict]) -> None:
+    """Copy the target list to the repo variable the GitHub schedule reads."""
+    if not shutil.which("gh"):
+        print("  GitHub: not synced (gh CLI not found); laptop checks still use it.")
+        return
+    proc = subprocess.run(["gh", "variable", "set", GITHUB_VARIABLE],
+                          input=json.dumps({"targets": entries}, ensure_ascii=False),
+                          capture_output=True, text=True, cwd=HERE)
+    if proc.returncode == 0:
+        print("  GitHub: synced; the next scheduled check uses the new list.")
+    else:
+        print(f"  GitHub: sync FAILED ({proc.stderr.strip()[:200]}). "
+              f"Laptop checks still use the new list.")
+
+
+def rule_text(entry: dict) -> str:
+    if entry.get("max_price") is not None:
+        return f"in stock at or under {format_inr(entry['max_price'])}"
+    if "match" in entry:
+        return f"variant {' + '.join(entry['match'])} listed and in stock"
+    return "in stock"
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    try:
+        entry = parse_link(args.url)
+        max_price = parse_price(args.max_price) if args.max_price else None
+    except ValueError as e:
+        print(f"Can't add that: {e}")
+        return 1
+    if max_price is not None:
+        entry["max_price"] = max_price
+
+    # Check the page once now, so a bad link fails here rather than at 3 a.m.
+    print(f"Checking {entry.get('url') or entry['asin']} ...")
+    try:
+        result = build_target({**entry, "label": "?"}).check()
+    except Blocked as e:
+        print(f"Couldn't read the page ({e}). Nothing added; try again in a minute.")
+        return 2
+    entry["label"] = args.label or short_label(result.title or entry["key"])
+
+    entries = load_entries()
+    replaced = any(e["key"] == entry["key"] for e in entries)
+    entries = [e for e in entries if e["key"] != entry["key"]] + [entry]
+    save_entries(entries)
+
+    now = format_inr(result.price) if result.price is not None else "no price shown"
+    print(f"{'Updated' if replaced else 'Added'} [{entry['key']}] {entry['label']}")
+    print(f"  Now: {now}, {'in stock' if result.status != 'out_of_stock' else 'sold out'}")
+    print(f"  Alert when: {rule_text(entry)}"
+          + ("  <- already true; you'll get an alert on the next check" if result.good else ""))
+    sync_github(entries)
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    entries = load_entries()
+    if not entries:
+        print("Nothing is being watched. Add something with: watch.py add <link> [max price]")
+        return 0
+    state = load_state()["targets"]
+    for n, e in enumerate(entries, 1):
+        ts = state.get(e["key"], {})
+        price = f"{format_inr(ts['price'])}, " if ts.get("price") is not None else ""
+        last = (f"{price}{ts.get('status_text', '?')} (checked {ts['last_check']})"
+                if "last_check" in ts else "not checked yet")
+        print(f"{n}. [{e['key']}] {SITES[e['site']]}: {e['label']}")
+        print(f"   alert when {rule_text(e)}; last: {last}")
+    return 0
+
+
+def cmd_remove(args: argparse.Namespace) -> int:
+    entries = load_entries()
+    wanted = args.target
+    if wanted.isdigit() and 1 <= int(wanted) <= len(entries):
+        matches = [entries[int(wanted) - 1]]
+    else:
+        matches = [e for e in entries if e["key"] == wanted] or \
+                  [e for e in entries if e["key"].startswith(wanted)]
+    if len(matches) != 1:
+        print(f"{'No' if not matches else 'More than one'} target matches {wanted!r}; "
+              f"see: watch.py list")
+        return 1
+    gone = matches[0]
+    entries = [e for e in entries if e["key"] != gone["key"]]
+    save_entries(entries)
+    state = load_state()
+    state["targets"].pop(gone["key"], None)
+    save_state(state)
+    print(f"Removed [{gone['key']}] {gone['label']}")
+    sync_github(entries)
+    return 0
+
+
+def set_schedules(enabled: bool) -> int:
+    """Enable or disable both the Windows task and the GitHub schedule."""
+    verb = "Enable" if enabled else "Disable"
+    ok = True
+    ps = shutil.which("powershell.exe")
+    if ps:
+        proc = subprocess.run([ps, "-NoProfile", "-Command",
+                               f"{verb}-ScheduledTask -TaskName '{WINDOWS_TASK}' | Out-Null"],
+                              capture_output=True, text=True)
+        ok &= proc.returncode == 0
+        print(f"  Laptop task: {'ok' if proc.returncode == 0 else 'FAILED ' + proc.stderr.strip()[:150]}")
+    else:
+        print("  Laptop task: skipped (not running under WSL)")
+    if shutil.which("gh"):
+        # gh only finds workflows in the opposite state, so check before toggling.
+        listing = subprocess.run(["gh", "workflow", "list", "--all", "--json", "name,state"],
+                                 capture_output=True, text=True, cwd=HERE)
+        states = {w["name"]: w["state"] for w in json.loads(listing.stdout or "[]")}
+        if (states.get("watch") == "active") == enabled:
+            print(f"  GitHub schedule: already {'on' if enabled else 'paused'}")
+        else:
+            proc = subprocess.run(["gh", "workflow", verb.lower(), "watch"],
+                                  capture_output=True, text=True, cwd=HERE)
+            ok &= proc.returncode == 0
+            print(f"  GitHub schedule: {'ok' if proc.returncode == 0 else 'FAILED ' + proc.stderr.strip()[:150]}")
+    else:
+        print("  GitHub schedule: skipped (gh CLI not found)")
+    return 0 if ok else 1
+
+
+def cmd_pause(args: argparse.Namespace) -> int:
+    print("Pausing all checks:")
+    return set_schedules(False)
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    print("Resuming checks:")
+    sync_github(load_entries())  # GitHub may hold an older list
+    return set_schedules(True)
+
+
 def main() -> int:
-    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p = argparse.ArgumentParser(
+        description=__doc__.split("\n")[0],
+        epilog="With no command, checks every target once (what the schedulers run).")
     p.add_argument("--only", nargs="+", metavar="KEY",
                    help="check only these target keys from targets.json")
     p.add_argument("--jitter", type=int, default=0,
@@ -523,7 +778,22 @@ def main() -> int:
                    help="after checking, push a low-priority 'still running' summary")
     p.add_argument("--test-notify", action="store_true",
                    help="send a test notification and exit")
+    sub = p.add_subparsers(dest="command", metavar="command")
+    add = sub.add_parser("add", help="watch an amazon.in or flipkart.com product link")
+    add.add_argument("url")
+    add.add_argument("max_price", nargs="?", help="alert only at or under this price")
+    add.add_argument("--label", help="name to show in alerts (default: from the page)")
+    sub.add_parser("list", help="show what's being watched and its last status")
+    rm = sub.add_parser("remove", help="stop watching a target")
+    rm.add_argument("target", help="number from 'list', or a key (or unique key prefix)")
+    sub.add_parser("pause", help="disable the laptop task and the GitHub schedule")
+    sub.add_parser("resume", help="re-enable both schedules")
     args = p.parse_args()
+
+    commands = {"add": cmd_add, "list": cmd_list, "remove": cmd_remove,
+                "pause": cmd_pause, "resume": cmd_resume}
+    if args.command in commands:
+        return commands[args.command](args)
 
     logging.basicConfig(
         level=logging.INFO,

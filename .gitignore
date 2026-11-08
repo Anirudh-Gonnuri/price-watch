@@ -6,3 +6,8 @@ __pycache__/
 
 # Private ntfy channel name (acts as its password)
 ntfy_topic.txt
+
+# What to watch: local only, synced to the WATCH_TARGETS repo variable
+targets.json
+targets.tmp
+*.bak

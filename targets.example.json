@@ -1,0 +1,26 @@
+{
+  "targets": [
+    {
+      "key": "flipkart-mobh8k8urfqt737m",
+      "site": "flipkart",
+      "label": "Samsung Galaxy S25 Ultra 5G (Titanium Whitesilver, 512 GB)",
+      "url": "https://www.flipkart.com/samsung-galaxy-s25-ultra-5g-titanium-whitesilver-512-gb/p/itm28d4275302a07?pid=MOBH8K8URFQT737M",
+      "max_price": 109999
+    },
+    {
+      "key": "amazon-b0dsklsv63",
+      "site": "amazon",
+      "label": "Samsung Galaxy S25 Ultra 5G AI Smartphone (Titanium Whitesilver, 12GB RAM, 512GB Storage)",
+      "host": "www.amazon.in",
+      "asin": "B0DSKLSV63"
+    },
+    {
+      "key": "amazon-s25u-whitesilver-512",
+      "site": "amazon",
+      "label": "S25 Ultra Whitesilver 512GB (variant not listed yet)",
+      "host": "www.amazon.in",
+      "listing": "B0DSKL9MQ8",
+      "match": ["512GB", "Whitesilver"]
+    }
+  ]
+}
