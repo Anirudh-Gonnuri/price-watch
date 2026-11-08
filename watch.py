@@ -45,6 +45,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Callable
 from xml.sax.saxutils import escape as xml_escape
@@ -530,6 +531,46 @@ def save_state(state: dict) -> None:
 # Running checks
 # --------------------------------------------------------------------------- #
 
+def events_path() -> Path | None:
+    """Where Atrium collects this room's events, or None when running outside it.
+
+    Atrium sets ATRIUM_EVENTS for what it runs itself. Scheduled runs are started by
+    Windows without it, so they rely on the room's place in the Atrium folder.
+    """
+    if os.environ.get("ATRIUM_EVENTS"):
+        return Path(os.environ["ATRIUM_EVENTS"])
+    if HERE.parent.name == "rooms":
+        return HERE.parent.parent / "local" / "price-watch" / "events.jsonl"
+    return None
+
+
+def emit(**fields) -> bool:
+    """Append one event line for Atrium. Never lets a logging problem stop a check."""
+    path = events_path()
+    if path is None:
+        return False
+    line = {"time": datetime.now(timezone.utc).isoformat(), **fields}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(line) + "\n")
+    except OSError as e:
+        log.warning("could not record an event: %s", e)
+        return False
+    return True
+
+
+def record_price(key: str, price: int | None, ts: dict) -> None:
+    """Add a graph point when the price moves, plus one a day so flat stretches still show."""
+    if price is None:
+        return
+    today = date.today().isoformat()
+    if ts.get("graphed_price") == price and ts.get("graphed_day") == today:
+        return
+    if emit(metrics=[{"name": key, "value": price}]):
+        ts["graphed_price"], ts["graphed_day"] = price, today
+
+
 def describe(result: Result) -> str:
     price = format_inr(result.price) if result.price is not None else "price not shown"
     return f"{price} - {result.title}" if result.title else price
@@ -573,7 +614,10 @@ def check_target(target: Target, ts: dict) -> bool:
              target.key, result.status, result.price, result.detail)
 
     previous, was_good = ts.get("status"), ts.get("good", False)
+    record_price(target.key, result.price, ts)
     if result.status != previous:
+        if previous is not None:
+            emit(message=f"{target.label}: {describe_change(result)}")
         if result.good and not was_good:
             notify(f"{name} is {result.status_text}!", describe(result), result.url)
         elif was_good and not result.good:
@@ -583,8 +627,14 @@ def check_target(target: Target, ts: dict) -> bool:
 
     ts.update(status=result.status, good=result.good, status_text=result.status_text,
               price=result.price, url=result.url,
-              last_check=time.strftime("%Y-%m-%d %H:%M:%S"))
+              last_check=time.strftime("%Y-%m-%d %H:%M:%S"),
+              last_check_at=datetime.now(timezone.utc).isoformat())
     return True
+
+
+def describe_change(result: Result) -> str:
+    price = f" at {format_inr(result.price)}" if result.price is not None else ""
+    return f"{result.status_text}{price}"
 
 
 def send_heartbeat(targets: list[Target], state: dict) -> None:
@@ -627,7 +677,9 @@ def run(args: argparse.Namespace, targets: list[Target] | None = None) -> int:
 # --------------------------------------------------------------------------- #
 
 GITHUB_VARIABLE = "WATCH_TARGETS"  # the scheduled workflow writes this to targets.json
-WINDOWS_TASK = "Price Watch"
+# Atrium registers this task from the schedule declared in atrium.json.
+WINDOWS_TASK_FOLDER = "\\Atrium\\"
+WINDOWS_TASK = "room-price-watch-check"
 
 
 def sync_github(entries: list[dict]) -> None:
@@ -702,6 +754,78 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def product_url(entry: dict, ts: dict) -> str | None:
+    if ts.get("url") or entry.get("url"):
+        return ts.get("url") or entry["url"]
+    asin = entry.get("asin") or entry.get("listing")
+    return f"https://{entry['host']}/dp/{asin}" if asin and entry.get("host") else None
+
+
+def is_struggling(ts: dict) -> bool:
+    return (ts.get("blocked_streak", 0) >= BLOCKED_ALERT_AFTER
+            or ts.get("layout_streak", 0) >= LAYOUT_ALERT_AFTER)
+
+
+def status_report() -> dict:
+    """What Atrium shows. Reads saved results only, so it's quick and never hits a shop."""
+    entries = load_entries()
+    state = load_state()
+    paused = state.get("paused", True)  # checks only run after an explicit resume
+
+    products = []
+    for e in entries:
+        ts = state["targets"].get(e["key"], {})
+        products.append({
+            "key": e["key"],
+            "site": SITES[e["site"]],
+            "label": e["label"],
+            "url": product_url(e, ts),
+            "rule": rule_text(e),
+            "maxPrice": e.get("max_price"),
+            "price": ts.get("price"),
+            "status": ts.get("status_text"),
+            "good": ts.get("good", False),
+            "lastCheckAt": ts.get("last_check_at"),
+            "struggling": is_struggling(ts),
+        })
+
+    ready = sum(p["good"] for p in products)
+    struggling = sum(p["struggling"] for p in products)
+    if paused:
+        headline = "Paused"
+    elif not products:
+        headline = "Nothing watched yet"
+    else:
+        headline = f"{len(products)} watched, {ready} ready to buy"
+
+    items = []
+    for p in products:
+        price = format_inr(p["price"]) if p["price"] is not None else None
+        items.append({"text": p["label"],
+                      "detail": ", ".join(x for x in (price, p["status"]) if x) or "Not checked yet"})
+    report = {
+        "state": "warning" if struggling else "ok",
+        "headline": headline,
+        "blocks": [
+            {"type": "stat", "label": "Watching", "value": str(len(products))},
+            {"type": "stat", "label": "Ready to buy", "value": str(ready)},
+            {"type": "toggle", "label": "Checking", "on": not paused,
+             "actionOn": "resume", "actionOff": "pause"},
+            {"type": "button", "action": "check", "disabled": not products},
+            {"type": "list", "label": "Products", "items": items},
+        ],
+        "data": {"paused": paused, "products": products},
+    }
+    if struggling:
+        report["detail"] = f"{struggling} can't be read right now; the shop may be blocking checks."
+    return report
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    print(json.dumps(status_report()))
+    return 0
+
+
 def cmd_remove(args: argparse.Namespace) -> int:
     entries = load_entries()
     wanted = args.target
@@ -732,7 +856,8 @@ def set_schedules(enabled: bool) -> int:
     ps = shutil.which("powershell.exe")
     if ps:
         proc = subprocess.run([ps, "-NoProfile", "-Command",
-                               f"{verb}-ScheduledTask -TaskName '{WINDOWS_TASK}' | Out-Null"],
+                               f"{verb}-ScheduledTask -TaskPath '{WINDOWS_TASK_FOLDER}' "
+                               f"-TaskName '{WINDOWS_TASK}' | Out-Null"],
                               capture_output=True, text=True)
         ok &= proc.returncode == 0
         print(f"  Laptop task: {'ok' if proc.returncode == 0 else 'FAILED ' + proc.stderr.strip()[:150]}")
@@ -752,6 +877,10 @@ def set_schedules(enabled: bool) -> int:
             print(f"  GitHub schedule: {'ok' if proc.returncode == 0 else 'FAILED ' + proc.stderr.strip()[:150]}")
     else:
         print("  GitHub schedule: skipped (gh CLI not found)")
+    if ok:
+        state = load_state()
+        state["paused"] = not enabled
+        save_state(state)
     return 0 if ok else 1
 
 
@@ -784,13 +913,14 @@ def main() -> int:
     add.add_argument("max_price", nargs="?", help="alert only at or under this price")
     add.add_argument("--label", help="name to show in alerts (default: from the page)")
     sub.add_parser("list", help="show what's being watched and its last status")
+    sub.add_parser("status", help="print the current state as JSON, for Atrium")
     rm = sub.add_parser("remove", help="stop watching a target")
     rm.add_argument("target", help="number from 'list', or a key (or unique key prefix)")
     sub.add_parser("pause", help="disable the laptop task and the GitHub schedule")
     sub.add_parser("resume", help="re-enable both schedules")
     args = p.parse_args()
 
-    commands = {"add": cmd_add, "list": cmd_list, "remove": cmd_remove,
+    commands = {"add": cmd_add, "list": cmd_list, "status": cmd_status, "remove": cmd_remove,
                 "pause": cmd_pause, "resume": cmd_resume}
     if args.command in commands:
         return commands[args.command](args)
