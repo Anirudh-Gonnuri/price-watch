@@ -9,6 +9,17 @@ from unittest import mock
 
 import watch
 
+
+
+def setUpModule():
+    """Keep every test away from Atrium's real history, wherever this folder lives."""
+    tmp = tempfile.TemporaryDirectory()
+    patcher = mock.patch.dict("os.environ", {"ATRIUM_EVENTS": str(Path(tmp.name) / "events.jsonl")})
+    patcher.start()
+    unittest.addModuleCleanup(tmp.cleanup)
+    unittest.addModuleCleanup(patcher.stop)
+
+
 URL = "https://www.amazon.in/dp/B0DSKL9MQ8"
 MARKER = watch.AMAZON_MARKER
 
@@ -398,6 +409,135 @@ class Alerts(unittest.TestCase):
         self.assertEqual(push.call_args.kwargs["priority"], "low")
         ts = watch.load_state()["targets"]["t"]
         self.assertEqual((ts["ok_since_heartbeat"], ts["blocked_since_heartbeat"]), (0, 0))
+
+
+class AtriumIntegration(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        self.events = root / "events.jsonl"
+        for patcher in (mock.patch.object(watch, "STATE_FILE", root / "state.json"),
+                        mock.patch.object(watch, "CONFIG_FILE", root / "targets.json"),
+                        mock.patch.dict("os.environ", {"ATRIUM_EVENTS": str(self.events)})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def lines(self):
+        if not self.events.exists():
+            return []
+        return [json.loads(line) for line in self.events.read_text().splitlines()]
+
+    def save(self, *entries):
+        watch.save_entries(list(entries))
+
+    def set_state(self, targets, **extra):
+        watch.save_state({"targets": targets, **extra})
+
+    entry = {"key": "flipkart-x", "site": "flipkart", "label": "Phone",
+             "url": "https://www.flipkart.com/p/x", "max_price": 100}
+
+    def test_new_install_reports_paused(self):
+        self.assertEqual(watch.status_report()["headline"], "Paused")
+        self.assertTrue(watch.status_report()["data"]["paused"])
+
+    def test_report_lists_products(self):
+        self.save(self.entry)
+        self.set_state({"flipkart-x": {"price": 90, "good": True, "status_text": "at target",
+                                       "last_check_at": "2026-11-08T10:00:00+00:00"}}, paused=False)
+        report = watch.status_report()
+        self.assertEqual(report["headline"], "1 watched, 1 ready to buy")
+        self.assertEqual(report["state"], "ok")
+        product = report["data"]["products"][0]
+        self.assertEqual(product["price"], 90)
+        self.assertEqual(product["site"], "Flipkart")
+        self.assertEqual(product["url"], "https://www.flipkart.com/p/x")
+
+    def test_report_is_valid_before_any_check(self):
+        self.save(self.entry)
+        report = watch.status_report()
+        self.assertEqual(report["blocks"][-1]["items"][0]["detail"], "Not checked yet")
+
+    def test_amazon_url_is_built_from_asin(self):
+        self.assertEqual(watch.product_url({"host": "www.amazon.in", "asin": "B1"}, {}),
+                         "https://www.amazon.in/dp/B1")
+
+    def test_blocked_for_long_is_a_warning(self):
+        self.save(self.entry)
+        self.set_state({"flipkart-x": {"blocked_streak": watch.BLOCKED_ALERT_AFTER}}, paused=False)
+        report = watch.status_report()
+        self.assertEqual(report["state"], "warning")
+        self.assertIn("1 can't be read", report["detail"])
+
+    def test_price_recorded_only_when_it_changes(self):
+        ts = {}
+        watch.record_price("k", 100, ts)
+        watch.record_price("k", 100, ts)
+        watch.record_price("k", 90, ts)
+        values = [line["metrics"][0]["value"] for line in self.lines()]
+        self.assertEqual(values, [100, 90])
+
+    def test_flat_price_recorded_once_a_day(self):
+        ts = {}
+        watch.record_price("k", 100, ts)
+        ts["graphed_day"] = "2020-01-01"
+        watch.record_price("k", 100, ts)
+        self.assertEqual(len(self.lines()), 2)
+
+    def test_missing_price_records_nothing(self):
+        watch.record_price("k", None, {})
+        self.assertEqual(self.lines(), [])
+
+    def result(self, status, good, price=100):
+        return watch.Result(status=status, good=good, status_text=status.replace("_", " "), price=price)
+
+    def target(self, result):
+        return watch.Target(key="k", site="Amazon", label="Phone", check=lambda: result)
+
+    def test_status_change_becomes_an_event(self):
+        ts = {"status": "out_of_stock", "good": False}
+        with mock.patch.object(watch, "notify"):
+            watch.check_target(self.target(self.result("in_stock", True)), ts)
+        messages = [line["message"] for line in self.lines() if "message" in line]
+        self.assertEqual(messages, ["Phone: in stock at \u20b9100"])
+
+    def test_first_check_is_not_an_event(self):
+        with mock.patch.object(watch, "notify"):
+            watch.check_target(self.target(self.result("in_stock", True)), {})
+        self.assertEqual([line for line in self.lines() if "message" in line], [])
+
+    def test_no_events_outside_atrium(self):
+        with mock.patch.dict("os.environ", clear=True), \
+             mock.patch.object(watch, "HERE", Path("/home/runner/work/price-watch")):
+            self.assertIsNone(watch.events_path())
+            self.assertFalse(watch.emit(message="x"))
+
+    def test_scheduled_runs_find_the_atrium_folder(self):
+        with mock.patch.dict("os.environ", clear=True), \
+             mock.patch.object(watch, "HERE", Path("/mnt/e/atrium/rooms/price-watch")):
+            self.assertEqual(watch.events_path(), Path("/mnt/e/atrium/local/price-watch/events.jsonl"))
+
+    def fake_tools(self, returncode=0):
+        run = mock.MagicMock(return_value=mock.MagicMock(returncode=returncode, stdout="[]", stderr="boom"))
+        which = mock.patch("shutil.which", side_effect=lambda name: "/x" if name == "powershell.exe" else None)
+        return run, which, mock.patch("subprocess.run", run)
+
+    def test_pause_targets_the_atrium_task_and_is_remembered(self):
+        run, which, patched = self.fake_tools()
+        self.set_state({}, paused=False)
+        with which, patched:
+            self.assertEqual(watch.set_schedules(False), 0)
+        command = run.call_args[0][0][-1]
+        self.assertIn("Disable-ScheduledTask -TaskPath '\\Atrium\\'", command)
+        self.assertIn("'room-price-watch-check'", command)
+        self.assertTrue(watch.load_state()["paused"])
+
+    def test_failed_pause_changes_nothing(self):
+        _, which, patched = self.fake_tools(returncode=1)
+        self.set_state({}, paused=False)
+        with which, patched:
+            self.assertEqual(watch.set_schedules(False), 1)
+        self.assertFalse(watch.load_state()["paused"])
 
 
 if __name__ == "__main__":

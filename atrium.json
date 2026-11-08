@@ -1,0 +1,47 @@
+{
+  "contract": 1,
+  "id": "price-watch",
+  "name": "Price Watcher",
+  "description": "Alerts when products are in stock or at your price.",
+  "icon": "tag",
+  "run": { "in": "wsl" },
+  "status": {
+    "command": ["python3", "watch.py", "status"],
+    "everySeconds": 60,
+    "timeoutSeconds": 30
+  },
+  "actions": {
+    "add": {
+      "label": "Add product",
+      "command": ["python3", "watch.py", "add", "{url}", "{maxPrice}"],
+      "timeoutSeconds": 150,
+      "params": {
+        "url": {
+          "label": "Product link",
+          "pattern": "https?://([a-z0-9-]+\\.)*(amazon\\.in|amzn\\.in|amzn\\.to|a\\.co|flipkart\\.com|fkrt\\.it|fkrt\\.cc)/\\S*",
+          "required": true
+        },
+        "maxPrice": { "label": "Alert price", "pattern": "[0-9][0-9,]*" }
+      }
+    },
+    "remove": {
+      "label": "Remove",
+      "confirm": true,
+      "command": ["python3", "watch.py", "remove", "{key}"],
+      "timeoutSeconds": 60,
+      "params": { "key": { "label": "Product", "pattern": "[a-z0-9][a-z0-9-]*", "required": true } }
+    },
+    "check": { "label": "Check now", "command": ["python3", "watch.py"], "timeoutSeconds": 300 },
+    "pause": { "label": "Pause", "command": ["python3", "watch.py", "pause"], "timeoutSeconds": 90 },
+    "resume": { "label": "Resume", "command": ["python3", "watch.py", "resume"], "timeoutSeconds": 90 }
+  },
+  "schedules": [
+    {
+      "id": "check",
+      "everyMinutes": 10,
+      "command": ["python3", "watch.py", "--jitter", "90"],
+      "timeLimitMinutes": 8,
+      "startPaused": true
+    }
+  ]
+}

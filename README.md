@@ -62,7 +62,7 @@ status changes. A CAPTCHA or unexpected page never counts as "unavailable":
 
 | Runner | When | Alerts |
 |---|---|---|
-| Windows Task Scheduler (`install-windows-task.ps1`) | every 10 min while the laptop is on | Windows toast + ntfy |
+| Windows Task Scheduler (`\\Atrium\\room-price-watch-check`) | every 10 min while the laptop is on | Windows toast + ntfy |
 | GitHub Actions (`.github/workflows/watch.yml`) | every 10 min, always | ntfy |
 
 From GitHub's data-centre IPs, Amazon serves a CAPTCHA on roughly 2 of 3 runs;
@@ -86,9 +86,8 @@ runner keeps its own state, so an event can alert once from each.
 - Phone alerts: install the [ntfy](https://ntfy.sh) app and subscribe to the
   topic in `ntfy_topic.txt` (git-ignored). The same value is the `NTFY_TOPIC`
   repo secret.
-- Local schedule, from WSL:
-  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w install-windows-task.ps1)"`
+- Local schedule: this is a room in [Atrium](https://github.com/Anirudh-Gonnuri/Atrium),
+  which registers the Windows task from `schedules` in `atrium.json`. Atrium also shows
+  status and price history and has a page for adding products.
 - Test notifications: `python3 watch.py --test-notify`
 - Tests (offline): `python3 -m unittest -v`
-- Remove the laptop task entirely:
-  `Unregister-ScheduledTask -TaskName 'Price Watch' -Confirm:$false` (PowerShell)
